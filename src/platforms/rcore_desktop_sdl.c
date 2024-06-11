@@ -64,7 +64,7 @@ typedef struct {
     SDL_Window *window;
     SDL_GLContext glContext;
 
-    SDL_Joystick *gamepad;
+    SDL_Joystick *gamepad[MAX_GAMEPADS];
     SDL_Cursor *cursor;
     bool cursorRelative;
 } PlatformData;
@@ -938,6 +938,21 @@ int SetGamepadMappings(const char *mappings)
     return SDL_GameControllerAddMapping(mappings);
 }
 
+// Set gamepad vibration
+void SetGamepadVibration(int gamepad, float leftMotor, float rightMotor)
+{
+    //Limit input values to between 0.0f and 1.0f
+    leftMotor  = (0.0f > leftMotor)  ? 0.0f : leftMotor;
+    rightMotor = (0.0f > rightMotor) ? 0.0f : rightMotor;
+    leftMotor  = (1.0f < leftMotor)  ? 1.0f : leftMotor;
+    rightMotor = (1.0f < rightMotor) ? 1.0f : rightMotor;
+
+    if (IsGamepadAvailable(gamepad))
+    {
+        SDL_JoystickRumble(platform.gamepad[gamepad], (Uint16)(leftMotor*65535.0f), (Uint16)(rightMotor*65535.0f), (Uint32)(MAX_GAMEPAD_VIBRATION_TIME*1000.0f));
+    }
+}
+
 // Set mouse position XY
 void SetMousePosition(int x, int y)
 {
@@ -954,6 +969,22 @@ void SetMouseCursor(int cursor)
     SDL_SetCursor(platform.cursor);
 
     CORE.Input.Mouse.cursor = cursor;
+}
+
+static void UpdateTouchPointsSDL(SDL_TouchFingerEvent event)
+{
+    CORE.Input.Touch.pointCount = SDL_GetNumTouchFingers(event.touchId);
+
+    for (int i = 0; i < CORE.Input.Touch.pointCount; i++)
+    {
+        SDL_Finger *finger = SDL_GetTouchFinger(event.touchId, i);
+        CORE.Input.Touch.pointId[i] = finger->id;
+        CORE.Input.Touch.position[i].x = finger->x*CORE.Window.screen.width;
+        CORE.Input.Touch.position[i].y = finger->y*CORE.Window.screen.height;
+        CORE.Input.Touch.currentTouchState[i] = 1;
+    }
+
+    for (int i = CORE.Input.Touch.pointCount; i < MAX_TOUCH_POINTS; i++) CORE.Input.Touch.currentTouchState[i] = 0;
 }
 
 // Register all input events
@@ -978,21 +1009,23 @@ void PollInputEvents(void)
     else CORE.Input.Mouse.previousPosition = CORE.Input.Mouse.currentPosition;
 
     // Reset last gamepad button/axis registered state
-    CORE.Input.Gamepad.lastButtonPressed = GAMEPAD_BUTTON_UNKNOWN;
-    for (int i = 0; i < MAX_GAMEPADS; i++) CORE.Input.Gamepad.axisCount[i] = 0;
+    for (int i = 0; (i < SDL_NumJoysticks()) && (i < MAX_GAMEPADS); i++)
+    {
+        // Check if gamepad is available
+        if (CORE.Input.Gamepad.ready[i])
+        {
+            // Register previous gamepad button states
+            for (int k = 0; k < MAX_GAMEPAD_BUTTONS; k++)
+            {
+                CORE.Input.Gamepad.previousButtonState[i][k] = CORE.Input.Gamepad.currentButtonState[i][k];
+            }
+        }
+    }
 
     // Register previous touch states
     for (int i = 0; i < MAX_TOUCH_POINTS; i++) CORE.Input.Touch.previousTouchState[i] = CORE.Input.Touch.currentTouchState[i];
 
-    // Reset touch positions
-    // TODO: It resets on target platform the mouse position and not filled again until a move-event,
-    // so, if mouse is not moved it returns a (0, 0) position... this behaviour should be reviewed!
-    //for (int i = 0; i < MAX_TOUCH_POINTS; i++) CORE.Input.Touch.position[i] = (Vector2){ 0, 0 };
-
     // Map touch position to mouse position for convenience
-    // WARNING: If the target desktop device supports touch screen, this behavious should be reviewed!
-    // https://www.codeproject.com/Articles/668404/Programming-for-Multi-Touch
-    // https://docs.microsoft.com/en-us/windows/win32/wintouch/getting-started-with-multi-touch-messages
     CORE.Input.Touch.position[0] = CORE.Input.Mouse.currentPosition;
 
     int touchAction = -1;       // 0-TOUCH_ACTION_UP, 1-TOUCH_ACTION_DOWN, 2-TOUCH_ACTION_MOVE
@@ -1075,11 +1108,17 @@ void PollInputEvents(void)
                         CORE.Window.currentFbo.height = height;
                         CORE.Window.resizedLastFrame = true;
                     } break;
+                    case SDL_WINDOWEVENT_ENTER:
+                    {
+                        CORE.Input.Mouse.cursorOnScreen = true;
+                    } break;
                     case SDL_WINDOWEVENT_LEAVE:
+                    {
+                        CORE.Input.Mouse.cursorOnScreen = false;
+                    } break;
                     case SDL_WINDOWEVENT_HIDDEN:
                     case SDL_WINDOWEVENT_MINIMIZED:
                     case SDL_WINDOWEVENT_FOCUS_LOST:
-                    case SDL_WINDOWEVENT_ENTER:
                     case SDL_WINDOWEVENT_SHOWN:
                     case SDL_WINDOWEVENT_FOCUS_GAINED:
                     case SDL_WINDOWEVENT_MAXIMIZED:
@@ -1092,7 +1131,17 @@ void PollInputEvents(void)
             case SDL_KEYDOWN:
             {
                 KeyboardKey key = ConvertScancodeToKey(event.key.keysym.scancode);
-                if (key != KEY_NULL) CORE.Input.Keyboard.currentKeyState[key] = 1;
+
+                if (key != KEY_NULL) {
+                    // If key was up, add it to the key pressed queue
+                    if ((CORE.Input.Keyboard.currentKeyState[key] == 0) && (CORE.Input.Keyboard.keyPressedQueueCount < MAX_KEY_PRESSED_QUEUE))
+                    {
+                        CORE.Input.Keyboard.keyPressedQueue[CORE.Input.Keyboard.keyPressedQueueCount] = key;
+                        CORE.Input.Keyboard.keyPressedQueueCount++;
+                    }
+
+                    CORE.Input.Keyboard.currentKeyState[key] = 1;
+                }
 
                 if (event.key.repeat) CORE.Input.Keyboard.keyRepeatInFrame[key] = 1;
 
@@ -1114,14 +1163,6 @@ void PollInputEvents(void)
                 // NOTE: event.text.text data comes an UTF-8 text sequence but we register codepoints (int)
 
                 int codepointSize = 0;
-
-                // Check if there is space available in the key queue
-                if (CORE.Input.Keyboard.keyPressedQueueCount < MAX_KEY_PRESSED_QUEUE)
-                {
-                    // Add character (key) to the queue
-                    CORE.Input.Keyboard.keyPressedQueue[CORE.Input.Keyboard.keyPressedQueueCount] = GetCodepointNext(event.text.text, &codepointSize);
-                    CORE.Input.Keyboard.keyPressedQueueCount++;
-                }
 
                 // Check if there is space available in the queue
                 if (CORE.Input.Keyboard.charPressedQueueCount < MAX_CHAR_PRESSED_QUEUE)
@@ -1182,53 +1223,158 @@ void PollInputEvents(void)
                 touchAction = 2;
             } break;
 
-            // Check touch events
-            // NOTE: These cases need to be reviewed on a real touch screen
             case SDL_FINGERDOWN:
             {
-                const int touchId = (int)event.tfinger.fingerId;
-                CORE.Input.Touch.currentTouchState[touchId] = 1;
-                CORE.Input.Touch.position[touchId].x = event.tfinger.x * CORE.Window.screen.width;
-                CORE.Input.Touch.position[touchId].y = event.tfinger.y * CORE.Window.screen.height;
-
+                UpdateTouchPointsSDL(event.tfinger);
                 touchAction = 1;
                 realTouch = true;
             } break;
             case SDL_FINGERUP:
             {
-                const int touchId = (int)event.tfinger.fingerId;
-                CORE.Input.Touch.currentTouchState[touchId] = 0;
-                CORE.Input.Touch.position[touchId].x = event.tfinger.x * CORE.Window.screen.width;
-                CORE.Input.Touch.position[touchId].y = event.tfinger.y * CORE.Window.screen.height;
-
+                UpdateTouchPointsSDL(event.tfinger);
                 touchAction = 0;
                 realTouch = true;
             } break;
             case SDL_FINGERMOTION:
             {
-                const int touchId = (int)event.tfinger.fingerId;
-                CORE.Input.Touch.position[touchId].x = event.tfinger.x * CORE.Window.screen.width;
-                CORE.Input.Touch.position[touchId].y = event.tfinger.y * CORE.Window.screen.height;
-
+                UpdateTouchPointsSDL(event.tfinger);
                 touchAction = 2;
                 realTouch = true;
             } break;
 
             // Check gamepad events
+            case SDL_JOYDEVICEADDED:
+            {
+                int jid = event.jdevice.which;
+
+                if (!CORE.Input.Gamepad.ready[jid] && (jid < MAX_GAMEPADS))
+                {
+                    platform.gamepad[jid] = SDL_JoystickOpen(jid);
+
+                    if (platform.gamepad[jid])
+                    {
+                        CORE.Input.Gamepad.ready[jid] = true;
+                        CORE.Input.Gamepad.axisCount[jid] = SDL_JoystickNumAxes(platform.gamepad[jid]);
+                        CORE.Input.Gamepad.axisState[jid][GAMEPAD_AXIS_LEFT_TRIGGER] = -1.0f;
+                        CORE.Input.Gamepad.axisState[jid][GAMEPAD_AXIS_RIGHT_TRIGGER] = -1.0f;
+                        strncpy(CORE.Input.Gamepad.name[jid], SDL_JoystickName(platform.gamepad[jid]), 63);
+                        CORE.Input.Gamepad.name[jid][63] = '\0';
+                    }
+                    else
+                    {
+                        TRACELOG(LOG_WARNING, "PLATFORM: Unable to open game controller [ERROR: %s]", SDL_GetError());
+                    }
+                }
+            } break;
+            case SDL_JOYDEVICEREMOVED:
+            {
+                int jid = event.jdevice.which;
+
+                if (jid == SDL_JoystickInstanceID(platform.gamepad[jid]))
+                {
+                    SDL_JoystickClose(platform.gamepad[jid]);
+                    platform.gamepad[jid] = SDL_JoystickOpen(0);
+                    CORE.Input.Gamepad.ready[jid] = false;
+                    memset(CORE.Input.Gamepad.name[jid], 0, 64);
+                }
+            } break;
+            case SDL_JOYBUTTONDOWN:
+            {
+                int button = -1;
+
+                switch (event.jbutton.button)
+                {
+                    case SDL_CONTROLLER_BUTTON_Y: button = GAMEPAD_BUTTON_RIGHT_FACE_UP; break;
+                    case SDL_CONTROLLER_BUTTON_B: button = GAMEPAD_BUTTON_RIGHT_FACE_RIGHT; break;
+                    case SDL_CONTROLLER_BUTTON_A: button = GAMEPAD_BUTTON_RIGHT_FACE_DOWN; break;
+                    case SDL_CONTROLLER_BUTTON_X: button = GAMEPAD_BUTTON_RIGHT_FACE_LEFT; break;
+
+                    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: button = GAMEPAD_BUTTON_LEFT_TRIGGER_1; break;
+                    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: button = GAMEPAD_BUTTON_RIGHT_TRIGGER_1; break;
+
+                    case SDL_CONTROLLER_BUTTON_BACK: button = GAMEPAD_BUTTON_MIDDLE_LEFT; break;
+                    case SDL_CONTROLLER_BUTTON_GUIDE: button = GAMEPAD_BUTTON_MIDDLE; break;
+                    case SDL_CONTROLLER_BUTTON_START: button = GAMEPAD_BUTTON_MIDDLE_RIGHT; break;
+
+                    case SDL_CONTROLLER_BUTTON_DPAD_UP: button = GAMEPAD_BUTTON_LEFT_FACE_UP; break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: button = GAMEPAD_BUTTON_LEFT_FACE_RIGHT; break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN: button = GAMEPAD_BUTTON_LEFT_FACE_DOWN; break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: button = GAMEPAD_BUTTON_LEFT_FACE_LEFT; break;
+
+                    case SDL_CONTROLLER_BUTTON_LEFTSTICK: button = GAMEPAD_BUTTON_LEFT_THUMB; break;
+                    case SDL_CONTROLLER_BUTTON_RIGHTSTICK: button = GAMEPAD_BUTTON_RIGHT_THUMB; break;
+                    default: break;
+                }
+
+                if (button >= 0)
+                {
+                    CORE.Input.Gamepad.currentButtonState[event.jbutton.which][button] = 1;
+                    CORE.Input.Gamepad.lastButtonPressed = button;
+                }
+            } break;
+            case SDL_JOYBUTTONUP:
+            {
+                int button = -1;
+
+                switch (event.jbutton.button)
+                {
+                    case SDL_CONTROLLER_BUTTON_Y: button = GAMEPAD_BUTTON_RIGHT_FACE_UP; break;
+                    case SDL_CONTROLLER_BUTTON_B: button = GAMEPAD_BUTTON_RIGHT_FACE_RIGHT; break;
+                    case SDL_CONTROLLER_BUTTON_A: button = GAMEPAD_BUTTON_RIGHT_FACE_DOWN; break;
+                    case SDL_CONTROLLER_BUTTON_X: button = GAMEPAD_BUTTON_RIGHT_FACE_LEFT; break;
+
+                    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: button = GAMEPAD_BUTTON_LEFT_TRIGGER_1; break;
+                    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: button = GAMEPAD_BUTTON_RIGHT_TRIGGER_1; break;
+
+                    case SDL_CONTROLLER_BUTTON_BACK: button = GAMEPAD_BUTTON_MIDDLE_LEFT; break;
+                    case SDL_CONTROLLER_BUTTON_GUIDE: button = GAMEPAD_BUTTON_MIDDLE; break;
+                    case SDL_CONTROLLER_BUTTON_START: button = GAMEPAD_BUTTON_MIDDLE_RIGHT; break;
+
+                    case SDL_CONTROLLER_BUTTON_DPAD_UP: button = GAMEPAD_BUTTON_LEFT_FACE_UP; break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: button = GAMEPAD_BUTTON_LEFT_FACE_RIGHT; break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN: button = GAMEPAD_BUTTON_LEFT_FACE_DOWN; break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: button = GAMEPAD_BUTTON_LEFT_FACE_LEFT; break;
+
+                    case SDL_CONTROLLER_BUTTON_LEFTSTICK: button = GAMEPAD_BUTTON_LEFT_THUMB; break;
+                    case SDL_CONTROLLER_BUTTON_RIGHTSTICK: button = GAMEPAD_BUTTON_RIGHT_THUMB; break;
+                    default: break;
+                }
+
+                if (button >= 0)
+                {
+                    CORE.Input.Gamepad.currentButtonState[event.jbutton.which][button] = 0;
+                    if (CORE.Input.Gamepad.lastButtonPressed == button) CORE.Input.Gamepad.lastButtonPressed = 0;
+                }
+            } break;
             case SDL_JOYAXISMOTION:
             {
-                // Motion on gamepad 0
-                if (event.jaxis.which == 0)
+                int axis = -1;
+
+                switch (event.jaxis.axis)
                 {
-                    // X axis motion
-                    if (event.jaxis.axis == 0)
+                    case SDL_CONTROLLER_AXIS_LEFTX: axis = GAMEPAD_AXIS_LEFT_X; break;
+                    case SDL_CONTROLLER_AXIS_LEFTY: axis = GAMEPAD_AXIS_LEFT_Y; break;
+                    case SDL_CONTROLLER_AXIS_RIGHTX: axis = GAMEPAD_AXIS_RIGHT_X; break;
+                    case SDL_CONTROLLER_AXIS_RIGHTY: axis = GAMEPAD_AXIS_RIGHT_Y; break;
+                    case SDL_CONTROLLER_AXIS_TRIGGERLEFT: axis = GAMEPAD_AXIS_LEFT_TRIGGER; break;
+                    case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: axis = GAMEPAD_AXIS_RIGHT_TRIGGER; break;
+                    default: break;
+                }
+
+                if (axis >= 0)
+                {
+                    // SDL axis value range is -32768 to 32767, we normalize it to RayLib's -1.0 to 1.0f range
+                    float value = event.jaxis.value / (float) 32767;
+                    CORE.Input.Gamepad.axisState[event.jaxis.which][axis] = value;
+
+                    // Register button state for triggers in addition to their axes
+                    if ((axis == GAMEPAD_AXIS_LEFT_TRIGGER) || (axis == GAMEPAD_AXIS_RIGHT_TRIGGER))
                     {
-                        //...
-                    }
-                    // Y axis motion
-                    else if (event.jaxis.axis == 1)
-                    {
-                        //...
+                        int button = (axis == GAMEPAD_AXIS_LEFT_TRIGGER) ? GAMEPAD_BUTTON_LEFT_TRIGGER_2 : GAMEPAD_BUTTON_RIGHT_TRIGGER_2;
+                        int pressed = (value > 0.1f);
+                        CORE.Input.Gamepad.currentButtonState[event.jaxis.which][button] = pressed;
+                        if (pressed) CORE.Input.Gamepad.lastButtonPressed = button;
+                        else if (CORE.Input.Gamepad.lastButtonPressed == button) CORE.Input.Gamepad.lastButtonPressed = 0;
                     }
                 }
             } break;
@@ -1275,8 +1421,9 @@ void PollInputEvents(void)
 // Initialize platform: graphics, inputs and more
 int InitPlatform(void)
 {
-    // Initialize SDL internal global state
-    int result = SDL_Init(SDL_INIT_EVERYTHING);
+    // Initialize SDL internal global state, only required systems
+    // NOTE: Not all systems need to be initialized, SDL_INIT_AUDIO is not required, managed by miniaudio
+    int result = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER);
     if (result < 0) { TRACELOG(LOG_WARNING, "SDL: Failed to initialize SDL"); return -1; }
 
     // Initialize graphic device: display/window and graphic context
@@ -1328,11 +1475,7 @@ int InitPlatform(void)
     {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-#if defined(__APPLE__)
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);  // OSX Requires forward compatibility
-#else
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-#endif
     }
     else if (rlGetVersion() == RL_OPENGL_43)
     {
@@ -1354,11 +1497,6 @@ int InitPlatform(void)
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    }
-
-    if (CORE.Window.flags & FLAG_VSYNC_HINT)
-    {
-        SDL_GL_SetSwapInterval(1);
     }
 
     if (CORE.Window.flags & FLAG_MSAA_4X_HINT)
@@ -1394,6 +1532,9 @@ int InitPlatform(void)
         TRACELOG(LOG_INFO, "    > Screen size:  %i x %i", CORE.Window.screen.width, CORE.Window.screen.height);
         TRACELOG(LOG_INFO, "    > Render size:  %i x %i", CORE.Window.render.width, CORE.Window.render.height);
         TRACELOG(LOG_INFO, "    > Viewport offsets: %i, %i", CORE.Window.renderOffset.x, CORE.Window.renderOffset.y);
+
+        if (CORE.Window.flags & FLAG_VSYNC_HINT) SDL_GL_SetSwapInterval(1);
+        else SDL_GL_SetSwapInterval(0);
     }
     else
     {
@@ -1408,10 +1549,20 @@ int InitPlatform(void)
 
     // Initialize input events system
     //----------------------------------------------------------------------------
-    if (SDL_NumJoysticks() >= 1)
+    // Initialize gamepads
+    for (int i = 0; (i < SDL_NumJoysticks()) && (i < MAX_GAMEPADS); i++)
     {
-        platform.gamepad = SDL_JoystickOpen(0);
-        //if (platform.gamepadgamepad == NULL) TRACELOG(LOG_WARNING, "PLATFORM: Unable to open game controller [ERROR: %s]", SDL_GetError());
+        platform.gamepad[i] = SDL_JoystickOpen(i);
+        if (platform.gamepad[i])
+        {
+            CORE.Input.Gamepad.ready[i] = true;
+            CORE.Input.Gamepad.axisCount[i] = SDL_JoystickNumAxes(platform.gamepad[i]);
+            CORE.Input.Gamepad.axisState[i][GAMEPAD_AXIS_LEFT_TRIGGER] = -1.0f;
+            CORE.Input.Gamepad.axisState[i][GAMEPAD_AXIS_RIGHT_TRIGGER] = -1.0f;
+            strncpy(CORE.Input.Gamepad.name[i], SDL_JoystickName(platform.gamepad[i]), 63);
+            CORE.Input.Gamepad.name[i][63] = '\0';
+        }
+        else TRACELOG(LOG_WARNING, "PLATFORM: Unable to open game controller [ERROR: %s]", SDL_GetError());
     }
 
     // Disable mouse events being interpreted as touch events
